@@ -3,6 +3,7 @@
 #include "node_warden_events.h"
 
 #include <ydb/core/blobstorage/bridge/proxy/bridge_proxy.h>
+#include <ydb/core/blobstorage/syncer/group_state_barrier.h>
 
 #include <ydb/core/blob_depot/agent/agent.h>
 
@@ -249,6 +250,9 @@ namespace NKikimr::NStorage {
             group.Info = TBlobStorageGroupInfo::Parse(*currentGroup, &mainKey, &err);
             if (group.Info->Type.GetErasure() == TBlobStorageGroupType::ErasureMirror3dc) {
                 group.NodeLayoutInfo = MakeIntrusive<TNodeLayoutInfo>(NodeLocationMap[LocalNodeId], group.Info, NodeLocationMap);
+                if (group.Info->GetTopology().GetTotalFailRealmsNum() == 3 && !group.Info->IsBridged()) {
+                    NGroupSyncer::RegisterGroupStateBarrierControls(groupId);
+                }
             }
             Y_ABORT_UNLESS(group.EncryptionParams.HasEncryptionMode());
             if (const TString& s = err.Str()) {

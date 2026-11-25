@@ -1,4 +1,5 @@
 #include "group_state.h"
+#include "group_state_barrier.h"
 #include "syncer.h"
 
 #include <ydb/core/blobstorage/base/blobstorage_events.h>
@@ -37,6 +38,7 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
         ConfirmConfig,
         Repair,
         CheckPromotion,
+        CheckStartup,
         Propose,
     };
 
@@ -50,6 +52,7 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
         ui32 RepairNode = 0;
         ui32 NextRepairDisk = 0;
         EStage Stage = EStage::ConfirmConfig;
+        std::unique_ptr<TGroupStateBarrier> Barrier;
 
         bool RequiresStartupConfirmation(ui32 realm) const {
             return WaitForRecoveringVDiskStartup(*Info.GroupState) && IsRecovering(Info.States[realm]);
@@ -139,6 +142,8 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
         }
         std::optional<TMirror3dcGroupConfiguration> config = message.Info ? GetConfiguration(*message.Info) : std::nullopt;
         if (config && message.Info->Topology && !message.Info->VDisks.empty()) {
+            // Register in stable states as well, so a test can arm the barrier before leaving NORMAL.
+            RegisterGroupStateBarrierControls(message.GroupId);
             auto policyStep = message.Info->TargetExcluded ? NextDataCenterTransition(*config, *message.Info->TargetExcluded) : std::nullopt;
             auto next = policyStep ? policyStep : RecoveringComplete(*config);
             if (!next) {
@@ -153,6 +158,8 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
                 ProposeState(message.GroupId, &group);
                 return;
             }
+            // Policy-driven proposals deliberately have no barrier: they must still be able to cancel recovery.
+            group.Barrier = std::make_unique<TGroupStateBarrier>(message.GroupId, SelfId());
             group.ConfirmedDisks.resize(group.Info.VDisks.size());
             StatusPollGroups.insert(message.GroupId);
         }
@@ -164,7 +171,8 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
         for (ui32 index = 0; index < group.Info.VDisks.size(); ++index) {
             if (!group.ConfirmedDisks[index]) {
                 const TVDiskID& disk = group.Info.VDisks[index].Id;
-                if (group.Stage == EStage::ConfirmConfig && group.RequiresStartupConfirmation(disk.FailRealm)) {
+                if ((group.Stage == EStage::ConfirmConfig || group.Stage == EStage::CheckStartup)
+                        && group.RequiresStartupConfirmation(disk.FailRealm)) {
                     return false;
                 }
                 uncertain |= TBlobStorageGroupInfo::TGroupVDisks(topology, TVDiskIdShort(disk));
@@ -208,6 +216,17 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
         }
         const TMirror3dcGroupConfiguration& next = group->Next;
         Y_ABORT_UNLESS(IsAllowedMirror3dcGroupTransition(*group->Info.GroupState, next.State));
+        if (group->Barrier && group->Barrier->ShouldHold(group->Info.Generation, *group->Info.GroupState, next.State)) {
+            if (WaitForRecoveringVDiskStartup(*group->Info.GroupState)) {
+                // Startup confirmations may become stale during a hold. Recheck all returning VDisks
+                // before expanding W from 2 to 2+2, including after the barrier is released.
+                group->Stage = EStage::CheckStartup;
+                group->ConfirmedDisks.assign(group->Info.VDisks.size(), false);
+                RepairGroups.erase(groupId);
+                StatusPollGroups.insert(groupId);
+            }
+            return;
+        }
         group->ProposalCookie = ++NextCookie;
         Proposals.emplace(group->ProposalCookie, groupId);
         Send(OwnerId, new TEvGroupState::TEvPropose(groupId, group->Info.Generation, next), 0, group->ProposalCookie);
@@ -219,7 +238,7 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
         }
         EraseQueries(groupId);
         group->Pending = 0;
-        if (group->Stage == EStage::CheckPromotion) {
+        if (group->Stage == EStage::CheckPromotion || group->Stage == EStage::CheckStartup) {
             ProposeState(groupId, group);
             return;
         }
@@ -264,12 +283,15 @@ class TGroupStateActor : public TActorBootstrapped<TGroupStateActor> {
                 }
                 ui32 groupId = *it++;
                 TGroup& group = Groups.at(groupId);
+                if (group.Barrier && !group.Barrier->IsEnabled(group.Info.Generation, *group.Info.GroupState)) {
+                    group.Barrier->Reset();
+                }
                 if (group.ProposalCookie) {
                     continue;
                 }
                 const bool checkPromotion = group.Stage == EStage::CheckPromotion;
-                if (checkPromotion) {
-                    // Health must come from one round after repair, including on proposal retries.
+                if (checkPromotion || group.Stage == EStage::CheckStartup) {
+                    // Health must come from one round after repair or a startup hold, including on proposal retries.
                     group.ConfirmedDisks.assign(group.Info.VDisks.size(), false);
                 }
                 ActiveGroups.push_back(groupId);
